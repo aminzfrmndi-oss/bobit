@@ -1,0 +1,218 @@
+import os
+import sqlite3
+import requests
+import uuid
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode
+from telegram.ext import (
+    Updater, CommandHandler, MessageHandler, Filters,
+    ConversationHandler, CallbackContext, CallbackQueryHandler
+)
+
+# ====== CONFIG ======
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+ADMIN_CHAT_IDS = [107900322, 1985420853]
+CARD_NUMBER = "6037-XXXX-XXXX-XXXX"
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+WAIT_CARD, WAIT_SELFIE, WAIT_AMOUNT, WAIT_PAYMENT_PROOF, WAIT_WALLET = range(5)
+DB_PATH = "orders.db"
+
+# --- دیتابیس ---
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS orders (
+        id TEXT PRIMARY KEY,
+        user_id INTEGER,
+        username TEXT,
+        amount_usdt REAL,
+        amount_irr INTEGER,
+        status TEXT,
+        created_at TEXT,
+        kyc_card TEXT,
+        kyc_selfie TEXT,
+        payment_proof TEXT,
+        wallet TEXT
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+def create_order_row(order):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+    INSERT INTO orders (id, user_id, username, amount_usdt, amount_irr,
+                        status, created_at, kyc_card, kyc_selfie, payment_proof, wallet)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        order['id'], order['user_id'], order.get('username'),
+        order.get('amount_usdt'), order.get('amount_irr'),
+        order.get('status'), order.get('created_at'),
+        order.get('kyc_card'), order.get('kyc_selfie'),
+        order.get('payment_proof'), order.get('wallet')
+    ))
+    conn.commit()
+    conn.close()
+
+def update_order_status(order_id, status):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("UPDATE orders SET status=? WHERE id=?", (status, order_id))
+    conn.commit()
+    conn.close()
+
+def fetch_order(order_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM orders WHERE id=?", (order_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+# --- API نرخ تتر ---
+def get_tether_rate():
+    try:
+        r = requests.get("https://api.arzinja.info/v2/tether", timeout=6)
+        j = r.json()
+        rate = int(j["data"]["sell"])
+        return rate
+    except:
+        return None
+
+# --- ذخیره عکس ---
+def save_photo(update: Update, context: CallbackContext, file_field_name):
+    photo = update.message.photo[-1]
+    file = context.bot.get_file(photo.file_id)
+    fname = f"{file_field_name}_{uuid.uuid4().hex}.jpg"
+    path = os.path.join(UPLOAD_DIR, fname)
+    file.download(path)
+    return path
+
+# --- Conversation ---
+def start(update: Update, context: CallbackContext):
+    sample_path = "sample_selfie.jpg"
+    if os.path.exists(sample_path):
+        context.bot.send_photo(chat_id=update.effective_chat.id, photo=open(sample_path,"rb"),
+                               caption="📸 لطفاً کارت ملی خود را ارسال کنید، بعد سلفی مطابق نمونه.")
+    else:
+        update.message.reply_text("📸 لطفاً کارت ملی خود را ارسال کنید.")
+    return WAIT_CARD
+
+def card_received(update: Update, context: CallbackContext):
+    path = save_photo(update, context, "card")
+    context.user_data['kyc_card'] = path
+    update.message.reply_text("✅ کارت ملی دریافت شد. حالا لطفاً سلفی ارسال کنید.")
+    return WAIT_SELFIE
+
+def selfie_received(update: Update, context: CallbackContext):
+    path = save_photo(update, context, "selfie")
+    context.user_data['kyc_selfie'] = path
+    update.message.reply_text("سلفی دریافت شد. برای مشاهده نرخ تتر /price را ارسال کنید.")
+    return ConversationHandler.END
+
+def price_cmd(update: Update, context: CallbackContext):
+    rate = get_tether_rate()
+    if rate:
+        update.message.reply_text(f"💰 نرخ لحظه‌ای تتر: *{rate:,} تومان*", parse_mode=ParseMode.MARKDOWN)
+        update.message.reply_text("مقدار تتر برای خرید را عدد وارد کنید (مثلاً 100).")
+        return WAIT_AMOUNT
+    else:
+        update.message.reply_text("خطا در دریافت نرخ.")
+        return ConversationHandler.END
+
+def amount_received(update: Update, context: CallbackContext):
+    amount = float(update.message.text.strip())
+    rate = get_tether_rate()
+    total = int(amount * rate)
+    context.user_data['amount_usdt'] = amount
+    context.user_data['amount_irr'] = total
+    update.message.reply_text(
+        f"💳 شماره کارت: {CARD_NUMBER}\n💵 مبلغ قابل پرداخت: {total:,} تومان\n"
+        "بعد از واریز، عکس فیش یا کد پیگیری را ارسال کنید."
+    )
+    return WAIT_PAYMENT_PROOF
+
+def payment_proof_received(update: Update, context: CallbackContext):
+    if update.message.photo:
+        path = save_photo(update, context, "payment")
+        context.user_data['payment_proof'] = path
+    else:
+        context.user_data['payment_proof'] = update.message.text.strip()
+    update.message.reply_text("لطفاً آدرس ولت مقصد را ارسال کنید.")
+    return WAIT_WALLET
+
+def wallet_received(update: Update, context: CallbackContext):
+    wallet = update.message.text.strip()
+    context.user_data['wallet'] = wallet
+    order_id = uuid.uuid4().hex
+    order = {
+        'id': order_id,
+        'user_id': update.effective_user.id,
+        'username': update.effective_user.username or update.effective_user.full_name,
+        'amount_usdt': context.user_data.get('amount_usdt'),
+        'amount_irr': context.user_data.get('amount_irr'),
+        'status': 'awaiting_admin',
+        'created_at': datetime.utcnow().isoformat(),
+        'kyc_card': context.user_data.get('kyc_card'),
+        'kyc_selfie': context.user_data.get('kyc_selfie'),
+        'payment_proof': context.user_data.get('payment_proof'),
+        'wallet': wallet
+    }
+    create_order_row(order)
+    update.message.reply_text("سفارش شما ثبت شد ✅ منتظر تایید ادمین باشید.")
+
+    caption = f"📩 سفارش جدید\n🆔 {order_id}\n👤 @{order['username']}\n💰 {order['amount_usdt']} USDT\n💵 {order['amount_irr']:,} تومان\n📥 {wallet}"
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ تایید", callback_data=f"approve|{order_id}"),
+        InlineKeyboardButton("❌ رد", callback_data=f"reject|{order_id}")
+    ]])
+    for admin_id in ADMIN_CHAT_IDS:
+        context.bot.send_message(chat_id=admin_id, text=caption, reply_markup=keyboard)
+    return ConversationHandler.END
+
+def admin_button(update: Update, context: CallbackContext):
+    query = update.callback_query
+    query.answer()
+    action, order_id = query.data.split("|")
+    if action == "approve":
+        update_order_status(order_id, "approved")
+        query.edit_message_text(f"✅ سفارش {order_id} تایید شد.")
+    else:
+        update_order_status(order_id, "rejected")
+        query.edit_message_text(f"❌ سفارش {order_id} رد شد.")
+
+def main():
+    init_db()
+    updater = Updater(TELEGRAM_TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    kyc_conv = ConversationHandler(
+        entry_points=[CommandHandler('start', start)],
+        states={
+            WAIT_CARD: [MessageHandler(Filters.photo, card_received)],
+            WAIT_SELFIE: [MessageHandler(Filters.photo, selfie_received)]
+        },
+        fallbacks=[]
+    )
+    purchase_conv = ConversationHandler(
+        entry_points=[CommandHandler('price', price_cmd)],
+        states={
+            WAIT_AMOUNT: [MessageHandler(Filters.text, amount_received)],
+            WAIT_PAYMENT_PROOF: [MessageHandler(Filters.text | Filters.photo, payment_proof_received)],
+            WAIT_WALLET: [MessageHandler(Filters.text, wallet_received)]
+        },
+        fallbacks=[]
+    )
+
+    dp.add_handler(kyc_conv)
+    dp.add_handler(purchase_conv)
+    dp.add_handler(CallbackQueryHandler(admin_button))
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == "__main__":
+    main()
